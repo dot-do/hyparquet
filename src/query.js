@@ -555,6 +555,9 @@ export function sliceAll(file, ranges) {
 function createVariantPredicates(filter, variantConfig = []) {
   const predicates = new Map()
 
+  // Known operators to skip (not column names)
+  const operators = new Set(['$and', '$or', '$nor', '$not', '$comment'])
+
   /**
    * @param {any} f - Filter object
    */
@@ -566,7 +569,8 @@ function createVariantPredicates(filter, variantConfig = []) {
     } else {
       // Process column-level conditions
       for (const [col, cond] of Object.entries(f)) {
-        if (col.startsWith('$') && !col.includes('.')) continue // Skip operators
+        // Skip known operators only (allow $ prefixed column names like $index_category)
+        if (operators.has(col)) continue
 
         // Check for dot-notation (Variant field access)
         const dotIndex = col.indexOf('.')
