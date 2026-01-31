@@ -2,9 +2,16 @@ import { parquetRead } from './read.js'
 
 export { parquetMetadata, parquetMetadataAsync, parquetSchema } from './metadata.js'
 export { parquetRead }
-export { parquetQuery } from './query.js'
+export { parquetQuery, matchesFilter } from './query.js'
 export { snappyUncompress } from './snappy.js'
 export { asyncBufferFromUrl, byteLengthFromUrl, cachedAsyncBuffer, flatten, toJson } from './utils.js'
+export {
+  parquetPlan,
+  extractFilterColumns,
+  extractVariantFilterColumns,
+  createNestedColumnIndexMap,
+  createPredicates,
+} from './plan.js'
 
 /**
  * This is a helper function to read parquet row data as a promise.
@@ -62,4 +69,5 @@ export function parquetReadObjects(options) {
  * @typedef {import('../src/types.d.ts').ParquetReadOptions} ParquetReadOptions
  * @typedef {import('../src/types.d.ts').MetadataOptions} MetadataOptions
  * @typedef {import('../src/types.d.ts').ParquetParsers} ParquetParsers
+ * @typedef {import('../src/types.d.ts').VariantShredConfig} VariantShredConfig
  */

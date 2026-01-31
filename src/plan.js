@@ -162,6 +162,25 @@ export function createColumnIndexMap(rowGroup) {
 }
 
 /**
+ * Create full path column mapping for nested columns.
+ * Maps full dot-notation paths to column indices for Variant shredding support.
+ *
+ * @param {RowGroup} rowGroup - row group metadata
+ * @returns {Map<string, number>} map from full path to index
+ */
+export function createNestedColumnIndexMap(rowGroup) {
+  const map = new Map()
+  rowGroup.columns.forEach((column, index) => {
+    if (column.meta_data?.path_in_schema?.length) {
+      // Map the full path (e.g., '$index.typed_value.titleType.typed_value')
+      const fullPath = column.meta_data.path_in_schema.join('.')
+      map.set(fullPath, index)
+    }
+  })
+  return map
+}
+
+/**
  * Extract column names from filter.
  * Needed to read filter columns that may not be in the output.
  *
@@ -189,6 +208,74 @@ export function extractFilterColumns(filter) {
   extract(filter)
   return [...columns]
 }
+
+/**
+ * Extract column names from filter with Variant shredding support.
+ * Returns both top-level columns to read and full paths for statistics.
+ *
+ * For '$index.titleType', returns:
+ * - readColumns: ['$index'] (the Variant column)
+ * - statsColumns: ['$index.typed_value.titleType.typed_value'] (for statistics)
+ *
+ * @param {object} filter - MongoDB-style filter object
+ * @param {VariantShredConfig[]} [variantConfig] - Variant shredding configuration
+ * @returns {{ readColumns: string[], statsColumns: string[] }}
+ */
+export function extractVariantFilterColumns(filter, variantConfig = []) {
+  const readColumns = new Set()
+  const statsColumns = new Set()
+
+  /**
+   * @param {any} f
+   */
+  function extract(f) {
+    if (f.$and || f.$or || f.$nor) {
+      (f.$and || f.$or || f.$nor).forEach(extract)
+    } else if (f.$not) {
+      extract(f.$not)
+    } else {
+      Object.keys(f).forEach((k) => {
+        if (k.startsWith('$') && !k.includes('.')) return // Skip operators
+
+        // Check for dot-notation (Variant field access)
+        const dotIndex = k.indexOf('.')
+        if (dotIndex > 0) {
+          const columnName = k.slice(0, dotIndex)
+          const fieldPath = k.slice(dotIndex + 1)
+
+          // Check if this is a shredded Variant column
+          const config = variantConfig.find(c => c.column === columnName)
+          if (config) {
+            const fieldName = fieldPath.split('.')[0]
+            if (config.fields.includes(fieldName)) {
+              // Need to read the Variant column
+              readColumns.add(columnName)
+              // Statistics path follows Parquet Variant Shredding spec
+              statsColumns.add(`${columnName}.typed_value.${fieldPath}.typed_value`)
+              return
+            }
+          }
+        }
+
+        // Regular column
+        readColumns.add(k)
+        statsColumns.add(k)
+      })
+    }
+  }
+
+  extract(filter)
+  return {
+    readColumns: [...readColumns],
+    statsColumns: [...statsColumns],
+  }
+}
+
+/**
+ * @typedef {Object} VariantShredConfig
+ * @property {string} column - Variant column name (e.g., '$index')
+ * @property {string[]} fields - Shredded field names
+ */
 
 /**
  * Create predicates from MongoDB-style filter.

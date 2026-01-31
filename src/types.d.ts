@@ -56,6 +56,22 @@ export type ParquetQueryOperator = {
 }
 
 /**
+ * Configuration for Variant shredding predicate pushdown.
+ * Maps user-level dot-notation filters to Parquet column statistics.
+ *
+ * Example: For filter { '$index.titleType': 'movie' }, with config:
+ *   { column: '$index', fields: ['titleType'] }
+ * The predicate will use statistics from:
+ *   $index.typed_value.titleType.typed_value
+ */
+export interface VariantShredConfig {
+  /** Variant column name (e.g., '$index') */
+  column: string
+  /** Field names that are shredded into typed columns */
+  fields: string[]
+}
+
+/**
  * A run of column data
  */
 export interface ColumnData {

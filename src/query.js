@@ -5,10 +5,17 @@ import { decodeDataPage, decodeDictionaryPage, readColumn } from './column.js'
 import { parquetReadObjects } from './index.js'
 import { DEFAULT_PARSERS } from './convert.js'
 import { concat, equals } from './utils.js'
-import { createColumnIndexMap, createPredicates, extractFilterColumns, getRowGroupFullRange } from './plan.js'
+import {
+  createColumnIndexMap,
+  createNestedColumnIndexMap,
+  createPredicates,
+  extractFilterColumns,
+  extractVariantFilterColumns,
+  getRowGroupFullRange,
+} from './plan.js'
 
 /**
- * @import {AsyncBuffer, FileMetaData, ColumnChunk, SchemaElement, ColumnIndex, OffsetIndex, CompressionCodec, Compressors, ParquetParsers, RowGroup, DecodedArray, ParquetReadOptions, ParquetQueryFilter} from './types.js'
+ * @import {AsyncBuffer, FileMetaData, ColumnChunk, SchemaElement, ColumnIndex, OffsetIndex, CompressionCodec, Compressors, ParquetParsers, RowGroup, DecodedArray, ParquetReadOptions, ParquetQueryFilter, VariantShredConfig} from './types.js'
  */
 
 /**
@@ -18,11 +25,15 @@ import { createColumnIndexMap, createPredicates, extractFilterColumns, getRowGro
  * Accepts optional filter object to filter the results and orderBy column name to sort the results.
  * Note that using orderBy may SIGNIFICANTLY increase the query time.
  *
- * @param {ParquetReadOptions & { filter?: ParquetQueryFilter, orderBy?: string, desc?: boolean, offset?: number, limit?: number }} options
+ * Supports Variant shredding for predicate pushdown on nested Variant fields.
+ * Pass variantConfig to enable dot-notation filters like { '$index.titleType': 'movie' }
+ * which map to statistics on $index.typed_value.titleType.typed_value columns.
+ *
+ * @param {ParquetReadOptions & { filter?: ParquetQueryFilter, variantConfig?: VariantShredConfig[], orderBy?: string, desc?: boolean, offset?: number, limit?: number }} options
  * @returns {Promise<Record<string, any>[]>} resolves when all requested rows and columns are parsed
  */
 export async function parquetQuery(options) {
-  const { file, filter, columns, orderBy, desc = false } = options
+  const { file, filter, columns, orderBy, desc = false, variantConfig = [] } = options
   const metadata = options.metadata || await parquetMetadataAsync(file)
 
   // Support both APIs since users might use either style
@@ -35,14 +46,25 @@ export async function parquetQuery(options) {
   const allColumns = schema.children.map((c) => c.element.name)
 
   // Need both output columns and filter columns for evaluation
-  const filterColumns = filter ? extractFilterColumns(filter) : []
+  // Use Variant-aware extraction if variantConfig is provided
+  let filterColumns, statsColumns
+  if (filter && variantConfig.length > 0) {
+    const extracted = extractVariantFilterColumns(filter, variantConfig)
+    filterColumns = extracted.readColumns
+    statsColumns = extracted.statsColumns
+  } else {
+    filterColumns = filter ? extractFilterColumns(filter) : []
+    statsColumns = filterColumns
+  }
+
   const outputColumns = columns || allColumns
   const requiredColumns = [...new Set([...outputColumns, ...filterColumns, ...orderBy ? [orderBy] : []].filter(Boolean))]
 
   // Convert filter to predicates that can test min/max statistics
-  const predicates = filter ? createPredicates(filter) : new Map()
+  // For Variant shredding, predicates use the stats column paths
+  const predicates = filter ? createVariantPredicates(filter, variantConfig) : new Map()
 
-  // Validate columns exist
+  // Validate columns exist (only check top-level read columns)
   if (filter) {
     const missingColumns = filterColumns.filter((col) => !allColumns.includes(col))
     if (missingColumns.length) {
@@ -204,16 +226,25 @@ export async function readLargeRowGroup(file, metadata, rgIndex, predicates, col
 }
 
 /**
- * Check if row group can contain matching rows based on statistics
+ * Check if row group can contain matching rows based on statistics.
+ * Supports both top-level columns and nested Variant shredded columns.
+ *
  * @param {RowGroup} rowGroup
  * @param {Map<string, (min: any, max: any) => boolean>} predicates
  * @returns {boolean}
  */
 function canRowGroupMatch(rowGroup, predicates) {
+  // Build both top-level and nested column maps
   const columnIndexMap = createColumnIndexMap(rowGroup)
+  const nestedIndexMap = createNestedColumnIndexMap(rowGroup)
 
-  for (const [columnName, predicate] of predicates) {
-    const colIndex = columnIndexMap.get(columnName)
+  for (const [columnPath, predicate] of predicates) {
+    // Try nested path first (for Variant shredding)
+    let colIndex = nestedIndexMap.get(columnPath)
+    // Fall back to top-level column
+    if (colIndex === undefined) {
+      colIndex = columnIndexMap.get(columnPath)
+    }
     if (colIndex === undefined) continue
 
     const column = rowGroup.columns[colIndex]
@@ -230,7 +261,9 @@ function canRowGroupMatch(rowGroup, predicates) {
 }
 
 /**
- * Read row group with page-level filtering
+ * Read row group with page-level filtering.
+ * Supports both top-level and nested Variant shredded columns.
+ *
  * @param {AsyncBuffer} file
  * @param {FileMetaData} metadata
  * @param {number} rgIndex
@@ -242,9 +275,10 @@ function canRowGroupMatch(rowGroup, predicates) {
 export async function readRowGroupWithPageFilter(file, metadata, rgIndex, predicates, columns, options) {
   const rowGroup = metadata.row_groups[rgIndex]
   const columnIndexMap = createColumnIndexMap(rowGroup)
+  const nestedIndexMap = createNestedColumnIndexMap(rowGroup)
 
   // Find pages that might contain matching data
-  const selectedPages = await selectPages(file, metadata, rowGroup, predicates, columnIndexMap)
+  const selectedPages = await selectPages(file, metadata, rowGroup, predicates, columnIndexMap, nestedIndexMap)
   if (!selectedPages || selectedPages.size === 0) return []
 
   // Read column data from selected pages
@@ -257,20 +291,28 @@ export async function readRowGroupWithPageFilter(file, metadata, rgIndex, predic
 }
 
 /**
- * Select pages that might contain matching rows
+ * Select pages that might contain matching rows.
+ * Supports both top-level and nested Variant shredded columns.
+ *
  * @param {AsyncBuffer} file
  * @param {FileMetaData} metadata
  * @param {RowGroup} rowGroup
  * @param {Map<string, (min: any, max: any) => boolean>} predicates
  * @param {Map<string, number>} columnIndexMap
+ * @param {Map<string, number>} [nestedIndexMap] - Optional nested column index map for Variant shredding
  * @returns {Promise<Set<number>|null>}
  */
-export async function selectPages(file, metadata, rowGroup, predicates, columnIndexMap) {
+export async function selectPages(file, metadata, rowGroup, predicates, columnIndexMap, nestedIndexMap) {
   const pageSelections = new Map()
   let hasAnyPages = false
 
-  for (const [columnName, predicate] of predicates) {
-    const colIndex = columnIndexMap.get(columnName)
+  for (const [columnPath, predicate] of predicates) {
+    // Try nested path first (for Variant shredding)
+    let colIndex = nestedIndexMap?.get(columnPath)
+    // Fall back to top-level column
+    if (colIndex === undefined) {
+      colIndex = columnIndexMap.get(columnPath)
+    }
     if (colIndex === undefined) continue
 
     const column = rowGroup.columns[colIndex]
@@ -500,6 +542,129 @@ export function sliceAll(file, ranges) {
 }
 
 /**
+ * Create predicates for Variant-aware filtering.
+ * Maps user filter paths to Parquet stats column paths.
+ *
+ * For filter { '$index.titleType': 'movie' }, creates predicate for:
+ * '$index.typed_value.titleType.typed_value'
+ *
+ * @param {object} filter - User filter object
+ * @param {VariantShredConfig[]} variantConfig - Variant shredding configuration
+ * @returns {Map<string, (min: any, max: any) => boolean>}
+ */
+function createVariantPredicates(filter, variantConfig = []) {
+  const predicates = new Map()
+
+  /**
+   * @param {any} f - Filter object
+   */
+  function processFilter(f) {
+    if (f.$and) {
+      f.$and.forEach(processFilter)
+    } else if (f.$or) {
+      // OR predicates across different columns can't use statistics effectively
+    } else {
+      // Process column-level conditions
+      for (const [col, cond] of Object.entries(f)) {
+        if (col.startsWith('$') && !col.includes('.')) continue // Skip operators
+
+        // Check for dot-notation (Variant field access)
+        const dotIndex = col.indexOf('.')
+        if (dotIndex > 0 && variantConfig.length > 0) {
+          const columnName = col.slice(0, dotIndex)
+          const fieldPath = col.slice(dotIndex + 1)
+
+          // Check if this is a shredded Variant column
+          const config = variantConfig.find(c => c.column === columnName)
+          if (config) {
+            const fieldName = fieldPath.split('.')[0]
+            if (config.fields.includes(fieldName)) {
+              // Map to Parquet Variant shredding statistics path
+              const statsPath = `${columnName}.typed_value.${fieldPath}.typed_value`
+              const pred = createRangePredicate(cond)
+              if (pred) predicates.set(statsPath, pred)
+              continue
+            }
+          }
+        }
+
+        // Regular column
+        const pred = createRangePredicate(cond)
+        if (pred) predicates.set(col, pred)
+      }
+    }
+  }
+
+  processFilter(filter)
+  return predicates
+}
+
+/**
+ * Create range predicate from condition.
+ * Returns a function that tests if a [min,max] range could contain matching values.
+ *
+ * @param {any} condition - filter condition (value or operators object)
+ * @returns {((min: any, max: any) => boolean)|null} predicate function or null
+ */
+function createRangePredicate(condition) {
+  // Handle direct value comparison
+  if (typeof condition !== 'object' || condition === null) {
+    return (min, max) => min <= condition && condition <= max
+  }
+
+  const { $eq, $gt, $gte, $lt, $lte, $in } = condition
+
+  // Test if statistics range could contain values matching the condition
+  return (min, max) => {
+    if ($eq !== undefined) {
+      return min <= $eq && $eq <= max
+    }
+
+    if ($in && Array.isArray($in)) {
+      return $in.some((v) => min <= v && v <= max)
+    }
+
+    let possible = true
+
+    if ($gt !== undefined) {
+      possible = possible && max > $gt
+    }
+    if ($gte !== undefined) {
+      possible = possible && max >= $gte
+    }
+    if ($lt !== undefined) {
+      possible = possible && min < $lt
+    }
+    if ($lte !== undefined) {
+      possible = possible && min <= $lte
+    }
+
+    return possible
+  }
+}
+
+/**
+ * Get nested value from row using dot-notation path.
+ * Supports paths like '$index.titleType' to access nested objects.
+ *
+ * @param {{[key: string]: any}} row
+ * @param {string} path
+ * @returns {any}
+ */
+function getNestedValue(row, path) {
+  const parts = path.split('.')
+  let current = row
+
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined
+    if (typeof current !== 'object') return undefined
+    current = current[part]
+  }
+
+  return current
+}
+
+/**
  * Assemble column data into rows
  * @param {Map<string, any[]>} columnData
  * @param {string[]} columns
@@ -524,7 +689,9 @@ export function assembleRows(columnData, columns) {
 }
 
 /**
- * Check if row matches filter
+ * Check if row matches filter.
+ * Supports dot-notation for accessing nested values (e.g., '$index.titleType').
+ *
  * @param {{[key: string]: any}} row
  * @param {any} filter
  * @returns {boolean}
@@ -548,9 +715,11 @@ export function matchesFilter(row, filter) {
 
   // Evaluate each column's condition
   for (const [col, cond] of Object.entries(filter)) {
-    if (col.startsWith('$')) continue
+    // Skip operators (but not dot-notation like '$index.titleType')
+    if (col.startsWith('$') && !col.includes('.')) continue
 
-    const value = /** @type {{[key: string]: any}} */ row[col]
+    // Use dot-notation access for nested paths, direct access otherwise
+    const value = col.includes('.') ? getNestedValue(row, col) : row[col]
     if (!matchesCondition(value, cond)) {
       return false
     }
