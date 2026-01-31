@@ -3,9 +3,11 @@ import { parquetMetadataAsync } from '../src/index.js'
 import { asyncBufferFromFile } from '../src/node.js'
 import {
   createColumnIndexMap,
+  createNestedColumnIndexMap,
   createPredicates,
   createRangePredicate,
   extractFilterColumns,
+  extractVariantFilterColumns,
   getColumnRange,
   getRowGroupFullRange,
   parquetPlan,
@@ -397,5 +399,171 @@ describe('createRangePredicate', () => {
     const pred = createRangePredicate({ $ne: 42 })
     expect(pred).toBeDefined() // still creates a predicate
     expect(pred?.(40, 50)).toBe(true) // but always returns true for unsupported ops
+  })
+})
+
+describe('createNestedColumnIndexMap', () => {
+  it('creates mapping from full paths to indexes', () => {
+    /** @type {RowGroup} */
+    const rowGroup = {
+      total_byte_size: 1000n,
+      num_rows: 100n,
+      columns: [
+        {
+          file_offset: 0n,
+          meta_data: {
+            type: 'BYTE_ARRAY',
+            encodings: ['PLAIN'],
+            path_in_schema: ['$index', 'metadata'],
+            codec: 'UNCOMPRESSED',
+            num_values: 100n,
+            total_uncompressed_size: 300n,
+            total_compressed_size: 300n,
+            data_page_offset: 100n,
+          },
+        },
+        {
+          file_offset: 0n,
+          meta_data: {
+            type: 'BYTE_ARRAY',
+            encodings: ['PLAIN'],
+            path_in_schema: ['$index', 'typed_value', 'titleType', 'typed_value'],
+            codec: 'UNCOMPRESSED',
+            num_values: 100n,
+            total_uncompressed_size: 400n,
+            total_compressed_size: 400n,
+            data_page_offset: 400n,
+          },
+        },
+        {
+          file_offset: 0n,
+          meta_data: {
+            type: 'INT32',
+            encodings: ['PLAIN'],
+            path_in_schema: ['$index', 'typed_value', 'startYear', 'typed_value'],
+            codec: 'UNCOMPRESSED',
+            num_values: 100n,
+            total_uncompressed_size: 300n,
+            total_compressed_size: 300n,
+            data_page_offset: 700n,
+          },
+        },
+      ],
+    }
+
+    const map = createNestedColumnIndexMap(rowGroup)
+    expect(map.get('$index.metadata')).toBe(0)
+    expect(map.get('$index.typed_value.titleType.typed_value')).toBe(1)
+    expect(map.get('$index.typed_value.startYear.typed_value')).toBe(2)
+    expect(map.size).toBe(3)
+  })
+
+  it('handles empty path_in_schema', () => {
+    /** @type {RowGroup} */
+    const rowGroup = {
+      total_byte_size: 0n,
+      num_rows: 0n,
+      columns: [
+        {
+          file_offset: 0n,
+          meta_data: {
+            type: 'BYTE_ARRAY',
+            encodings: ['PLAIN'],
+            path_in_schema: [],
+            codec: 'UNCOMPRESSED',
+            num_values: 0n,
+            total_uncompressed_size: 0n,
+            total_compressed_size: 0n,
+            data_page_offset: 0n,
+          },
+        },
+      ],
+    }
+
+    const map = createNestedColumnIndexMap(rowGroup)
+    expect(map.size).toBe(0)
+  })
+})
+
+describe('extractVariantFilterColumns', () => {
+  const variantConfig = [
+    { column: '$index', fields: ['titleType', 'startYear'] },
+  ]
+
+  it('extracts read and stats columns from Variant filter', () => {
+    const result = extractVariantFilterColumns(
+      { '$index.titleType': 'movie' },
+      variantConfig
+    )
+    expect(result.readColumns).toEqual(['$index'])
+    expect(result.statsColumns).toEqual(['$index.typed_value.titleType.typed_value'])
+  })
+
+  it('handles multiple Variant fields', () => {
+    const result = extractVariantFilterColumns(
+      { '$index.titleType': 'movie', '$index.startYear': { $gt: 2000 } },
+      variantConfig
+    )
+    expect(result.readColumns).toEqual(['$index'])
+    expect(result.statsColumns).toContain('$index.typed_value.titleType.typed_value')
+    expect(result.statsColumns).toContain('$index.typed_value.startYear.typed_value')
+  })
+
+  it('handles mix of Variant and regular columns', () => {
+    const result = extractVariantFilterColumns(
+      { '$index.titleType': 'movie', name: 'test' },
+      variantConfig
+    )
+    expect(result.readColumns).toContain('$index')
+    expect(result.readColumns).toContain('name')
+    expect(result.statsColumns).toContain('$index.typed_value.titleType.typed_value')
+    expect(result.statsColumns).toContain('name')
+  })
+
+  it('handles $and with Variant fields', () => {
+    const result = extractVariantFilterColumns(
+      { $and: [{ '$index.titleType': 'movie' }, { '$index.startYear': { $gt: 2000 } }] },
+      variantConfig
+    )
+    expect(result.readColumns).toEqual(['$index'])
+    expect(result.statsColumns).toContain('$index.typed_value.titleType.typed_value')
+    expect(result.statsColumns).toContain('$index.typed_value.startYear.typed_value')
+  })
+
+  it('handles $or with Variant fields', () => {
+    const result = extractVariantFilterColumns(
+      { $or: [{ '$index.titleType': 'movie' }, { '$index.titleType': 'tvSeries' }] },
+      variantConfig
+    )
+    expect(result.readColumns).toEqual(['$index'])
+    expect(result.statsColumns).toEqual(['$index.typed_value.titleType.typed_value'])
+  })
+
+  it('returns empty arrays for empty filter', () => {
+    const result = extractVariantFilterColumns({}, variantConfig)
+    expect(result.readColumns).toEqual([])
+    expect(result.statsColumns).toEqual([])
+  })
+
+  it('handles non-shredded Variant fields', () => {
+    // genres is not in the shredded fields list
+    const result = extractVariantFilterColumns(
+      { '$index.genres': ['Action'] },
+      variantConfig
+    )
+    // Non-shredded field should be treated as regular dot-notation
+    expect(result.readColumns).toEqual(['$index.genres'])
+    expect(result.statsColumns).toEqual(['$index.genres'])
+  })
+
+  it('handles deeply nested paths', () => {
+    const result = extractVariantFilterColumns(
+      { '$index.titleType.subType': 'something' },
+      variantConfig
+    )
+    // titleType is shredded, so the top-level column should be read
+    expect(result.readColumns).toEqual(['$index'])
+    // Stats column should include the full nested path
+    expect(result.statsColumns).toEqual(['$index.typed_value.titleType.subType.typed_value'])
   })
 })

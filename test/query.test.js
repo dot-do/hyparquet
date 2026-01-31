@@ -290,6 +290,64 @@ describe('matchesFilter', () => {
     const row = { name: 'John' }
     expect(matchesFilter(row, { name: 'John', $comment: 'ignored' })).toBe(true)
   })
+
+  // Dot-notation support for Variant shredding
+  it('matches dot-notation paths for nested objects', () => {
+    const row = {
+      name: 'John',
+      '$index': { titleType: 'movie', startYear: 2020 },
+    }
+    expect(matchesFilter(row, { '$index.titleType': 'movie' })).toBe(true)
+    expect(matchesFilter(row, { '$index.titleType': 'tvSeries' })).toBe(false)
+    expect(matchesFilter(row, { '$index.startYear': { $gt: 2015 } })).toBe(true)
+  })
+
+  it('matches deeply nested dot-notation paths', () => {
+    const row = {
+      data: { level1: { level2: { value: 42 } } },
+    }
+    expect(matchesFilter(row, { 'data.level1.level2.value': 42 })).toBe(true)
+    expect(matchesFilter(row, { 'data.level1.level2.value': 100 })).toBe(false)
+  })
+
+  it('handles missing nested paths gracefully', () => {
+    const row = { name: 'John' }
+    expect(matchesFilter(row, { 'missing.path': 'value' })).toBe(false)
+    expect(matchesFilter(row, { 'name.child': 'value' })).toBe(false)
+  })
+
+  it('handles null values in nested path', () => {
+    const row = { data: null }
+    expect(matchesFilter(row, { 'data.child': 'value' })).toBe(false)
+  })
+
+  it('handles $-prefixed keys with dots (Variant columns)', () => {
+    const row = {
+      '$index': { titleType: 'movie' },
+      '$data': { genres: ['Action'] },
+    }
+    expect(matchesFilter(row, { '$index.titleType': 'movie' })).toBe(true)
+    // $data.genres is not a string operator, so it should use dot-notation
+    expect(matchesFilter(row, { '$data.genres': ['Action'] })).toBe(true)
+  })
+
+  it('combines dot-notation with logical operators', () => {
+    const row = {
+      '$index': { titleType: 'movie', startYear: 2020 },
+    }
+    expect(matchesFilter(row, {
+      $and: [
+        { '$index.titleType': 'movie' },
+        { '$index.startYear': { $gte: 2020 } },
+      ],
+    })).toBe(true)
+    expect(matchesFilter(row, {
+      $or: [
+        { '$index.titleType': 'tvSeries' },
+        { '$index.startYear': 2020 },
+      ],
+    })).toBe(true)
+  })
 })
 
 describe('matchesCondition', () => {
