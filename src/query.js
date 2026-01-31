@@ -713,10 +713,13 @@ export function matchesFilter(row, filter) {
     return !matchesFilter(row, filter.$not)
   }
 
+  // Known operators to skip (not column names)
+  const operators = new Set(['$and', '$or', '$nor', '$not', '$comment'])
+
   // Evaluate each column's condition
   for (const [col, cond] of Object.entries(filter)) {
-    // Skip operators (but not dot-notation like '$index.titleType')
-    if (col.startsWith('$') && !col.includes('.')) continue
+    // Skip known operators only
+    if (operators.has(col)) continue
 
     // Use dot-notation access for nested paths, direct access otherwise
     const value = col.includes('.') ? getNestedValue(row, col) : row[col]
