@@ -18,6 +18,9 @@ import {
  * @import {AsyncBuffer, FileMetaData, ColumnChunk, SchemaElement, ColumnIndex, OffsetIndex, CompressionCodec, Compressors, ParquetParsers, RowGroup, DecodedArray, ParquetReadOptions, ParquetQueryFilter, VariantShredConfig} from './types.js'
  */
 
+// Hoisted to module level to avoid creating new Set on every filter evaluation
+const FILTER_OPERATORS = new Set(['$and', '$or', '$nor', '$not', '$comment'])
+
 /**
  * Query parquet file with predicate pushdown.
  * This is a parquet-aware query engine that can read a subset of rows and columns.
@@ -555,9 +558,6 @@ export function sliceAll(file, ranges) {
 function createVariantPredicates(filter, variantConfig = []) {
   const predicates = new Map()
 
-  // Known operators to skip (not column names)
-  const operators = new Set(['$and', '$or', '$nor', '$not', '$comment'])
-
   /**
    * @param {any} f - Filter object
    */
@@ -570,7 +570,7 @@ function createVariantPredicates(filter, variantConfig = []) {
       // Process column-level conditions
       for (const [col, cond] of Object.entries(f)) {
         // Skip known operators only (allow $ prefixed column names like $index_category)
-        if (operators.has(col)) continue
+        if (FILTER_OPERATORS.has(col)) continue
 
         // Check for dot-notation (Variant field access)
         const dotIndex = col.indexOf('.')
@@ -607,6 +607,8 @@ function createVariantPredicates(filter, variantConfig = []) {
  * Create range predicate from condition.
  * Returns a function that tests if a [min,max] range could contain matching values.
  *
+ * Supports both MongoDB-style operators ($lt, $gt, etc.) and shorthand (<, >, etc.)
+ *
  * @param {any} condition - filter condition (value or operators object)
  * @returns {((min: any, max: any) => boolean)|null} predicate function or null
  */
@@ -616,7 +618,13 @@ function createRangePredicate(condition) {
     return (min, max) => min <= condition && condition <= max
   }
 
-  const { $eq, $gt, $gte, $lt, $lte, $in } = condition
+  // Support both MongoDB-style ($lt) and shorthand (<) operators
+  const $eq = condition.$eq ?? condition['=']
+  const $gt = condition.$gt ?? condition['>']
+  const $gte = condition.$gte ?? condition['>=']
+  const $lt = condition.$lt ?? condition['<']
+  const $lte = condition.$lte ?? condition['<=']
+  const $in = condition.$in ?? condition.in
 
   // Test if statistics range could contain values matching the condition
   return (min, max) => {
@@ -717,13 +725,10 @@ export function matchesFilter(row, filter) {
     return !matchesFilter(row, filter.$not)
   }
 
-  // Known operators to skip (not column names)
-  const operators = new Set(['$and', '$or', '$nor', '$not', '$comment'])
-
   // Evaluate each column's condition
   for (const [col, cond] of Object.entries(filter)) {
     // Skip known operators only
-    if (operators.has(col)) continue
+    if (FILTER_OPERATORS.has(col)) continue
 
     // Use dot-notation access for nested paths, direct access otherwise
     const value = col.includes('.') ? getNestedValue(row, col) : row[col]
@@ -736,7 +741,9 @@ export function matchesFilter(row, filter) {
 }
 
 /**
- * Check if value matches condition
+ * Check if value matches condition.
+ * Supports both MongoDB-style operators ($lt, $gt, etc.) and shorthand (<, >, etc.)
+ *
  * @param {any} value
  * @param {any} condition
  * @returns {boolean}
@@ -751,24 +758,31 @@ export function matchesCondition(value, condition) {
   for (const [op, target] of Object.entries(condition)) {
     switch (op) {
     case '$eq':
+    case '=':
       if (!equals(value, target)) return false
       break
     case '$ne':
+    case '!=':
       if (equals(value, target)) return false
       break
     case '$gt':
+    case '>':
       if (!(value > target)) return false
       break
     case '$gte':
+    case '>=':
       if (!(value >= target)) return false
       break
     case '$lt':
+    case '<':
       if (!(value < target)) return false
       break
     case '$lte':
+    case '<=':
       if (!(value <= target)) return false
       break
     case '$in':
+    case 'in':
       if (!Array.isArray(target) || !target.includes(value)) return false
       break
     case '$nin':

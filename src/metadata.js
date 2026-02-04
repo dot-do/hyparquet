@@ -283,6 +283,13 @@ export function convertMetadata(value, schema, parsers) {
   const view = new DataView(value.buffer, value.byteOffset, value.byteLength)
   if (type === 'FLOAT' && view.byteLength === 4) return view.getFloat32(0, true)
   if (type === 'DOUBLE' && view.byteLength === 8) return view.getFloat64(0, true)
+  // DECIMAL must be checked BEFORE INT32/INT64 since DECIMAL columns use those physical types
+  // Statistics for DECIMAL are stored as scaled integers; we must apply the scale factor
+  if (converted_type === 'DECIMAL' || logical_type?.type === 'DECIMAL') {
+    // @ts-ignore - logical_type.scale exists when type === 'DECIMAL'
+    const scale = schema.scale ?? (logical_type?.type === 'DECIMAL' ? logical_type.scale : 0) ?? 0
+    return parseDecimal(value) * 10 ** -scale
+  }
   if (type === 'INT32' && converted_type === 'DATE') return parsers.dateFromDays(view.getInt32(0, true))
   if (type === 'INT64' && converted_type === 'TIMESTAMP_MILLIS') return parsers.timestampFromMilliseconds(view.getBigInt64(0, true))
   if (type === 'INT64' && converted_type === 'TIMESTAMP_MICROS') return parsers.timestampFromMicroseconds(view.getBigInt64(0, true))
@@ -291,7 +298,6 @@ export function convertMetadata(value, schema, parsers) {
   if (type === 'INT64' && logical_type?.type === 'TIMESTAMP') return parsers.timestampFromMilliseconds(view.getBigInt64(0, true))
   if (type === 'INT32' && view.byteLength === 4) return view.getInt32(0, true)
   if (type === 'INT64' && view.byteLength === 8) return view.getBigInt64(0, true)
-  if (converted_type === 'DECIMAL') return parseDecimal(value) * 10 ** -(schema.scale || 0)
   if (logical_type?.type === 'FLOAT16') return parseFloat16(value)
   if (type === 'FIXED_LEN_BYTE_ARRAY') return value
   // assert(false)

@@ -316,6 +316,8 @@ export function createPredicates(filter) {
  * Create range predicate from condition.
  * Returns a function that tests if a [min,max] range could contain matching values.
  *
+ * Supports both MongoDB-style operators ($lt, $gt, etc.) and shorthand (<, >, etc.)
+ *
  * @param {any} condition - filter condition (value or operators object)
  * @returns {((min: any, max: any) => boolean)|null} predicate function or null
  */
@@ -325,7 +327,13 @@ export function createRangePredicate(condition) {
     return (min, max) => min <= condition && condition <= max
   }
 
-  const { $eq, $gt, $gte, $lt, $lte, $in } = condition
+  // Support both MongoDB-style ($lt) and shorthand (<) operators
+  const $eq = condition.$eq ?? condition['=']
+  const $gt = condition.$gt ?? condition['>']
+  const $gte = condition.$gte ?? condition['>=']
+  const $lt = condition.$lt ?? condition['<']
+  const $lte = condition.$lte ?? condition['<=']
+  const $in = condition.$in ?? condition.in
 
   // Test if statistics range could contain values matching the condition
   return (min, max) => {
