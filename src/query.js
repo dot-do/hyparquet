@@ -37,6 +37,21 @@ const FILTER_OPERATORS = new Set(['$and', '$or', '$nor', '$not', '$comment'])
  */
 export async function parquetQuery(options) {
   const { file, filter, columns, orderBy, desc = false, variantConfig = [] } = options
+
+  // Fast path: delegate to parquetReadObjects when no query features are needed
+  // This avoids the overhead of query infrastructure for simple reads
+  if (!filter && !orderBy && variantConfig.length === 0) {
+    const rowStart = options.offset ?? options.rowStart ?? 0
+    const rowEnd = options.limit !== undefined
+      ? rowStart + options.limit
+      : options.rowEnd
+    return parquetReadObjects({
+      ...options,
+      rowStart,
+      rowEnd,
+    })
+  }
+
   const metadata = options.metadata || await parquetMetadataAsync(file)
 
   // Support both APIs since users might use either style
@@ -61,7 +76,14 @@ export async function parquetQuery(options) {
   }
 
   const outputColumns = columns || allColumns
-  const requiredColumns = [...new Set([...outputColumns, ...filterColumns, ...orderBy ? [orderBy] : []].filter(Boolean))]
+
+  // Build required columns set efficiently without intermediate arrays
+  const requiredSet = new Set(outputColumns)
+  for (const col of filterColumns) {
+    if (col) requiredSet.add(col)
+  }
+  if (orderBy) requiredSet.add(orderBy)
+  const requiredColumns = [...requiredSet]
 
   // Convert filter to predicates that can test min/max statistics
   // For Variant shredding, predicates use the stats column paths
@@ -99,14 +121,19 @@ export async function parquetQuery(options) {
 
     /** @type {typeof readSmallRowGroup | typeof readLargeRowGroup} */
     const groupDataFn = useSmallGroupOptimization ? readSmallRowGroup : readLargeRowGroup
-    let groupData = await groupDataFn(file, metadata, rgIndex, predicates, requiredColumns, options, groupStart)
+    const groupData = await groupDataFn(file, metadata, rgIndex, predicates, requiredColumns, options, groupStart)
 
-    // Apply filter if needed
+    // Apply filter and accumulate rows
+    // When filtering, push matching rows directly to avoid intermediate array allocation
     if (filter) {
-      groupData = groupData.filter((row) => matchesFilter(row, filter))
+      for (let i = 0; i < groupData.length; i++) {
+        if (matchesFilter(groupData[i], filter)) {
+          rows.push(groupData[i])
+        }
+      }
+    } else {
+      concat(rows, groupData)
     }
-
-    concat(rows, groupData)
 
     // Early exit for limited queries without sorting
     if (!orderBy && limit !== undefined && rows.length >= offset + limit) {
